@@ -1,0 +1,84 @@
+import { NextRequest, NextResponse } from "next/server";
+import { revalidatePath } from "next/cache";
+import { db } from "@/lib/db";
+import { requireAdmin } from "@/lib/require-admin";
+import { z } from "zod";
+
+const schema = z.object({
+  title: z.string().min(3).optional(),
+  excerpt: z.string().min(5).optional(),
+  content: z.string().min(20).optional(),
+  author: z.string().optional(),
+  status: z.enum(["DRAFT", "PUBLISHED", "ARCHIVED"]).optional(),
+  coverImage: z.string().optional().nullable(),
+});
+
+export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const guard = await requireAdmin();
+  if (guard.error) return guard.error;
+  const { id } = await params;
+  const post = await db.getBlogPostById(id);
+  if (!post) return NextResponse.json({ success: false, error: { code: "NOT_FOUND", message: "Post not found." } }, { status: 404 });
+  revalidatePath("/blog");
+    revalidatePath("/");
+    return NextResponse.json({ success: true, post });
+}
+
+export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const guard = await requireAdmin();
+  if (guard.error) return guard.error;
+  const { id } = await params;
+
+  const parsed = schema.safeParse(await req.json());
+  if (!parsed.success) {
+    return NextResponse.json(
+      { success: false, error: { code: "VALIDATION_ERROR", message: parsed.error.issues[0]?.message } },
+      { status: 400 }
+    );
+  }
+
+  const existing = await db.getBlogPostById(id);
+  const patch = { ...parsed.data } as Record<string, unknown>;
+  if (parsed.data.status === "PUBLISHED" && existing && !existing.publishedAt) {
+    patch.publishedAt = new Date().toISOString();
+  }
+
+  const updated = await db.updateBlogPost(id, patch);
+  if (!updated) {
+    return NextResponse.json({ success: false, error: { code: "NOT_FOUND", message: "Post not found." } }, { status: 404 });
+  }
+
+  await db.logAudit({
+    actorType: "ADMIN",
+    actorId: guard.admin!.id,
+    actorName: guard.admin!.name,
+    action: "BLOG_POST_UPDATED",
+    entity: "blog_post",
+    entityId: updated.id,
+  });
+
+  revalidatePath("/blog");
+    revalidatePath("/");
+    return NextResponse.json({ success: true, post: updated });
+}
+
+export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const guard = await requireAdmin();
+  if (guard.error) return guard.error;
+  const { id } = await params;
+  const ok = await db.deleteBlogPost(id);
+  if (!ok) return NextResponse.json({ success: false, error: { code: "NOT_FOUND", message: "Post not found." } }, { status: 404 });
+
+  await db.logAudit({
+    actorType: "ADMIN",
+    actorId: guard.admin!.id,
+    actorName: guard.admin!.name,
+    action: "BLOG_POST_DELETED",
+    entity: "blog_post",
+    entityId: id,
+  });
+
+  revalidatePath("/blog");
+    revalidatePath("/");
+    return NextResponse.json({ success: true });
+}
